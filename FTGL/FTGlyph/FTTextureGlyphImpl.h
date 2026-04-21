@@ -76,6 +76,25 @@ private:
     int glTextureID;
 
     /**
+     * BAND-AID -- deferred upload state. See FTTextureGlyph.cpp
+     * constructor for the full Band-Aid banner; short version: the
+     * FreeType glyph bitmap is copied here in the constructor and
+     * uploaded into the GL atlas on the first RenderImpl call, to avoid
+     * a Metal/GL Qt event-loop re-entrancy race in the host application
+     * that can drop in-flight glTexSubImage2D commands.
+     *
+     * The FT_Bitmap buffer is only valid until the next FT_Load_Glyph on
+     * that slot, so it must be copied out in the constructor.
+     *
+     * Architectural fix belongs in
+     * src/lib/app/RvCommon/RVMetalView.mm; tracked in TECH_DEBT.md.
+     */
+    int xOffsetCached;
+    int yOffsetCached;
+    unsigned char* bitmapData;
+    bool uploaded;
+
+    /**
      * The texture index of the currently active texture
      *
      * We keep track of the currently active texture to try to reduce the

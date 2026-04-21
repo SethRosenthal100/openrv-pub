@@ -28,6 +28,7 @@
 #include <iostream>
 
 #include <math.h>
+#include <cstring>
 
 #include "FTGL/ftgl.h"
 #include "FTGL/ErrorCheck.h"
@@ -68,6 +69,10 @@ FTTextureGlyphImpl::FTTextureGlyphImpl(FT_GlyphSlot glyph, int id, int xOffset,
     , destWidth(0)
     , destHeight(0)
     , glTextureID(id)
+    , xOffsetCached(xOffset)
+    , yOffsetCached(yOffset)
+    , bitmapData(0)
+    , uploaded(false)
 {
     /* FIXME: need to propagate the render mode all the way down to
      * here in order to get FT_RENDER_MODE_MONO aliased fonts.
@@ -86,18 +91,54 @@ FTTextureGlyphImpl::FTTextureGlyphImpl(FT_GlyphSlot glyph, int id, int xOffset,
 
     if (destWidth && destHeight)
     {
-        glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
-        glPixelStorei(GL_UNPACK_LSB_FIRST, GL_FALSE);
-        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
-        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
-
-        glBindTexture(GL_TEXTURE_2D, glTextureID);
-        glTexSubImage2D(GL_TEXTURE_2D, 0, xOffset, yOffset, destWidth,
-                        destHeight, GL_ALPHA, GL_UNSIGNED_BYTE, bitmap.buffer);
-
-        FTGL_GLDEBUG
-
-        glPopClientAttrib();
+        // =====================================================================
+        // BAND-AID — workaround for host-application architectural debt.
+        // =====================================================================
+        // FTGL itself is correct: uploading a glyph bitmap into a GL atlas
+        // from a constructor is standard OpenGL. This workaround exists
+        // because OpenRV's Metal/GL bridge has a re-entrancy race that
+        // silently drops in-flight glTexSubImage2D commands.
+        //
+        // The race, in detail:
+        //   OpenRV runs OpenGL on Apple Silicon via a Metal/IOSurface
+        //   bridge. Any call that drains the Metal command queue
+        //   synchronously -- glFinish (explicit or inside the driver) and
+        //   some internal sync points -- pumps the Qt event loop inline. A
+        //   pending MTKView drawable-size-change event then runs its
+        //   IOSurface-FBO-recreation handler re-entrantly, unbinds the
+        //   atlas texture, and discards the in-flight glTexSubImage2D
+        //   before it commits to GPU memory. The result is a zero-filled
+        //   region in the font atlas -- visually, a blank glyph.
+        //
+        // Evidence that FTGL is not the broken component:
+        //   The bug disappears after a "clear session" -- not because the
+        //   FTGL path is broken on first load, but because by the time
+        //   glyphs are re-created the MTKView has finished its resize
+        //   dance and no re-entrant events are pending. The upload code is
+        //   fine; the surrounding GL/Qt state is what varies.
+        //
+        // Smoking-gun diagnostic (2026-04-21 investigation):
+        //   [FTGL POST-UP-BIND] xOff=419 boundTex=4 atlasW=16384 ... OK
+        //   [FTGL POST-UP-BIND] xOff=437 boundTex=0 atlasW=0    ... unbound
+        //   [RVMetalView] Drawable size will change: 2316 x 1826
+        //   [FTGL READBACK]    xOff=437  sum=0  nonzero=0/510  ... data lost
+        //
+        // Workaround applied here:
+        //   Copy the FT_Bitmap buffer in the constructor (the slot buffer
+        //   is only valid until the next FT_Load_Glyph/FT_Load_Char, so it
+        //   must be copied). Defer glTexSubImage2D to the first RenderImpl
+        //   call, which always executes inside a stable draw pass with no
+        //   pending resize events.
+        //
+        // The correct architectural fix is in the host application, not
+        // here. See src/lib/app/RvCommon/RVMetalView.mm
+        // (drawableSizeWillChange:) for the pointer-comment tracking this
+        // debt, and TECH_DEBT.md ("Metal/GL Qt event-loop re-entrancy
+        // race") for the catalogued entry.
+        // =====================================================================
+        size_t nbytes = (size_t)destWidth * (size_t)destHeight;
+        bitmapData = new unsigned char[nbytes];
+        memcpy(bitmapData, bitmap.buffer, nbytes);
     }
 
     //      0
@@ -118,7 +159,10 @@ FTTextureGlyphImpl::FTTextureGlyphImpl(FT_GlyphSlot glyph, int id, int xOffset,
     corner = FTPoint(glyph->bitmap_left, glyph->bitmap_top);
 }
 
-FTTextureGlyphImpl::~FTTextureGlyphImpl() {}
+FTTextureGlyphImpl::~FTTextureGlyphImpl()
+{
+    delete[] bitmapData;
+}
 
 const FTPoint& FTTextureGlyphImpl::RenderImpl(const FTPoint& pen,
                                               int renderMode)
@@ -129,6 +173,42 @@ const FTPoint& FTTextureGlyphImpl::RenderImpl(const FTPoint& pen,
     {
         glBindTexture(GL_TEXTURE_2D, (GLuint)glTextureID);
         activeTextureID = glTextureID;
+    }
+
+    // First-time upload of the glyph bitmap. BAND-AID: deferred from the
+    // constructor to avoid a Metal/GL Qt event-loop re-entrancy race. See
+    // the BAND-AID banner on the constructor above (and TECH_DEBT.md)
+    // for the full explanation.
+    if (!uploaded && bitmapData && destWidth > 0 && destHeight > 0)
+    {
+        glPushClientAttrib(GL_CLIENT_PIXEL_STORE_BIT);
+        glPixelStorei(GL_UNPACK_LSB_FIRST, GL_FALSE);
+        glPixelStorei(GL_UNPACK_ROW_LENGTH, 0);
+        glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+        glPixelStorei(GL_UNPACK_SKIP_PIXELS, 0);
+        glPixelStorei(GL_UNPACK_SKIP_ROWS, 0);
+
+        // A GL_PIXEL_UNPACK_BUFFER bound by some other code path (e.g.
+        // RV's image upload path) would cause glTexSubImage2D to treat
+        // bitmapData as a byte offset into that PBO. Unbind around the
+        // upload, then restore.
+        GLint savedUnpackBuffer = 0;
+        glGetIntegerv(GL_PIXEL_UNPACK_BUFFER_BINDING, &savedUnpackBuffer);
+        if (savedUnpackBuffer) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, 0);
+
+        glTexSubImage2D(GL_TEXTURE_2D, 0, xOffsetCached, yOffsetCached,
+                        destWidth, destHeight, GL_ALPHA, GL_UNSIGNED_BYTE,
+                        bitmapData);
+
+        if (savedUnpackBuffer) glBindBuffer(GL_PIXEL_UNPACK_BUFFER, savedUnpackBuffer);
+
+        FTGL_GLDEBUG
+
+        glPopClientAttrib();
+
+        uploaded = true;
+        delete[] bitmapData;
+        bitmapData = 0;
     }
 
     dx = floor(pen.Xf() + corner.Xf());
